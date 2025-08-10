@@ -22,6 +22,7 @@ import time
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TEACHER_EMB_PATH = DATA_DIR / "teacher_embedding.npy"
+TEACHER_META_PATH = DATA_DIR / "teacher_embedding.json"
 MODEL_PATH = DATA_DIR / "embedding_net.pt"
 DATASET_ROOT = DATA_DIR / "dataset"
 DATASET_ROOT.mkdir(parents=True, exist_ok=True)
@@ -48,6 +49,13 @@ def load_audio_from_bytes(b: bytes, sr: int = SAMPLE_RATE) -> np.ndarray:
     # normalize
     if len(y) == 0:
         return np.zeros(sr, dtype=np.float32)
+    # trim leading/trailing silence to focus on voice
+    try:
+        yt, _ = librosa.effects.trim(y, top_db=30)
+        if len(yt) > sr // 10:  # keep if at least 100ms remains
+            y = yt
+    except Exception:
+        pass
     y = y / (np.max(np.abs(y)) + 1e-9)
     return y.astype(np.float32)
 
@@ -67,6 +75,16 @@ def extract_features(y: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
     feats = [agg(mfcc), agg(rms), agg(centroid)]
     vec = np.concatenate(feats).astype(np.float32)
     return vec
+
+
+def engineered_feature_dim() -> int:
+    # mfcc mean+std -> N_MFCC*2, rms mean+std -> 2, centroid mean+std -> 2
+    return (N_MFCC * 2) + 2 + 2
+
+
+def current_embedding_dim() -> int:
+    # If a trained model exists we output 128, else engineered feature dim
+    return 128 if MODEL_PATH.exists() else engineered_feature_dim()
 
 
 def to_model_embedding(vec: np.ndarray) -> np.ndarray:
@@ -112,6 +130,17 @@ async def enroll(audio: UploadFile = File(...)):
     feats = extract_features(y)
     emb = to_model_embedding(feats)
     np.save(TEACHER_EMB_PATH, emb)
+    # write meta for validation
+    meta = {
+        "created_at": time.time(),
+        "dim": int(emb.shape[0]),
+        "space": "model" if MODEL_PATH.exists() else "engineered",
+        "model_mtime": (MODEL_PATH.stat().st_mtime if MODEL_PATH.exists() else None),
+    }
+    try:
+        TEACHER_META_PATH.write_text(json.dumps(meta))
+    except Exception:
+        pass
     return EnrollResponse(ok=True, embedding_dim=int(emb.shape[0]))
 
 
@@ -121,6 +150,11 @@ async def verify(audio: UploadFile = File(...), threshold: float = Form(0.75)):
         return VerifyResponse(ok=False, similarity=0.0, threshold=threshold, is_teacher=False)
 
     teacher_emb = np.load(TEACHER_EMB_PATH)
+    # enforce same embedding space
+    exp_dim = current_embedding_dim()
+    if int(getattr(teacher_emb, 'shape', [0])[0]) != exp_dim:
+        # force re-enroll to avoid misleading results
+        return VerifyResponse(ok=False, similarity=0.0, threshold=threshold, is_teacher=False)
     content = await audio.read()
     y = load_audio_from_bytes(content)
     feats = extract_features(y)
@@ -316,7 +350,7 @@ class AudioListener:
         self.running = threading.Event()
         self.threshold = 0.75
         self.teacher_emb: Optional[np.ndarray] = None
-        self.buffer = deque(maxlen=CHUNK_SAMPLES * 2)  # keep some extra
+        self.buffer = deque(maxlen=CHUNK_SAMPLES * 2)
         self.stream: Optional[sd.InputStream] = None
         # smoothing & alert params
         self.smooth_window = 4
@@ -324,17 +358,17 @@ class AudioListener:
         self.alert_cooldown_sec = 3.0
         self._recent = deque(maxlen=10)
         self._cooldown_until = 0.0
-    self.min_rms = 0.02  # energy gate: below this, treat as non-teacher/noise
-    # latency/stride controls
-    self.chunk_sec = CHUNK_SEC
-    self.chunk_samples = int(SAMPLE_RATE * self.chunk_sec)
-    self.interval_ms = 500  # inference interval
-    self.block_sec = 0.25
-    # speech activity threshold (only count noise during active speech)
-    self.speech_rms = 0.04
-    self._recent_decisions = deque(maxlen=10)  # only active speech frames
+        # energy/speech gates
+        self.min_rms = 0.02
+        self.speech_rms = 0.04
+        self._recent_decisions = deque(maxlen=10)
+        # latency/stride controls
+        self.chunk_sec = CHUNK_SEC
+        self.chunk_samples = int(SAMPLE_RATE * self.chunk_sec)
+        self.interval_ms = 500
+        self.block_sec = 0.25
 
-    def _callback(self, indata, frames, time, status):  # sounddevice callback
+    def _callback(self, indata, frames, time, status):
         if status:
             self.hub.publish({"type": "status", "message": str(status)})
         mono = indata[:, 0].astype(np.float32)
@@ -342,7 +376,6 @@ class AudioListener:
 
     def start(self, teacher_emb: np.ndarray, threshold: float = 0.75, *, smooth_window: Optional[int] = None, min_noise_count: Optional[int] = None, cooldown_sec: Optional[float] = None, min_rms: Optional[float] = None, chunk_sec: Optional[float] = None, interval_ms: Optional[int] = None, speech_rms: Optional[float] = None):
         if self.thread and self.thread.is_alive():
-            # already running, update threshold and teacher emb
             self.threshold = threshold
             self.teacher_emb = teacher_emb
             if smooth_window is not None:
@@ -399,33 +432,34 @@ class AudioListener:
 
     def _run_loop(self):
         self.buffer.clear()
-    self._recent = deque(maxlen=max(2, self.smooth_window))
-    self._recent_decisions = deque(maxlen=max(2, self.smooth_window))
+        self._recent = deque(maxlen=max(2, self.smooth_window))
+        self._recent_decisions = deque(maxlen=max(2, self.smooth_window))
         self._cooldown_until = 0.0
         try:
             self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32', callback=self._callback, blocksize=int(self.block_sec * SAMPLE_RATE))
             self.stream.start()
-            # accumulate and classify every ~0.5s on last 2s window
             while self.running.is_set():
                 sd.sleep(self.interval_ms)
                 if len(self.buffer) >= self.chunk_samples:
-                    # Take the newest 2s
                     buf = np.array(list(self.buffer)[-self.chunk_samples:], dtype=np.float32)
-                    # Energy gate
                     t0 = time.time()
                     rms = float(np.sqrt(np.mean(buf ** 2) + 1e-12))
                     gated = rms < self.min_rms
                     active = rms >= self.speech_rms
+                    # Spectral flatness (0 tonal, 1 noise). Treat very flat frames as noise-only.
+                    try:
+                        sf = float(np.mean(librosa.feature.spectral_flatness(y=buf)))
+                    except Exception:
+                        sf = 0.0
+                    noise_like = sf >= 0.6  # heuristic
                     sim = -1.0
                     is_teacher = False
-                    if not gated and active:
-                        # Feature and similarity
+                    if not gated and active and not noise_like:
                         feats = extract_features(buf)
                         emb = to_model_embedding(feats)
                         sim = cosine_similarity(self.teacher_emb, emb)
                         is_teacher = bool(sim >= self.threshold)
                     proc_ms = int((time.time() - t0) * 1000)
-                    # smoothing over active speech only
                     if active and not gated:
                         self._recent_decisions.append(is_teacher)
                     window = list(self._recent_decisions)[-self.smooth_window:]
@@ -444,12 +478,13 @@ class AudioListener:
                         "gated": gated,
                         "active": active,
                         "speech_rms": float(self.speech_rms),
+                        "spectral_flatness": sf,
+                        "noise_like": noise_like,
                         "active_count": int(active_count),
                         "ts": time.time(),
                         "proc_ms": proc_ms,
                     }
                     self.hub.publish(event)
-                    # fire alert on smoothed condition with cooldown
                     now = time.time()
                     if active_count > 0 and noise_count >= self.min_noise_count and now >= self._cooldown_until:
                         self._cooldown_until = now + self.alert_cooldown_sec
@@ -489,6 +524,11 @@ async def ws_listen(ws: WebSocket, threshold: Optional[float] = None, smooth_win
         await ws.close()
         return
     teacher_emb = np.load(TEACHER_EMB_PATH)
+    exp_dim = current_embedding_dim()
+    if int(getattr(teacher_emb, 'shape', [0])[0]) != exp_dim:
+        await ws.send_json({"type": "error", "message": "Teacher profile is outdated for current model. Please re-enroll the teacher voice."})
+        await ws.close()
+        return
     thr = float(threshold) if threshold is not None else 0.75
     # Start the listener
     listener.start(teacher_emb, thr, smooth_window=smooth_window, min_noise_count=min_noise_count, cooldown_sec=cooldown, min_rms=min_rms, chunk_sec=chunk_sec, interval_ms=interval_ms, speech_rms=speech_rms)

@@ -25,7 +25,7 @@
   <div class="card">
     <h1>Teacher Voice Monitoring</h1>
 
-    <h2>Milestone 2: Teacher Enrollment</h2>
+    <h2> Teacher Enrollment</h2>
     <p>Record the teacher's voice and save the embedding.</p>
     <div class="row" style="margin-bottom:0.5rem;">
       <button id="btnRecord">Record Teacher Voice</button>
@@ -371,7 +371,8 @@
               redrawGraph();
             }
             const sim = (typeof data.similarity === 'number') ? data.similarity.toFixed(3) : 'n/a';
-            const msg = `Sim ${sim} / Thr ${data.threshold} | is_teacher: ${data.is_teacher} | rms ${data.rms?.toFixed ? data.rms.toFixed(3) : 'n/a'}`;
+            const flat = (typeof data.spectral_flatness === 'number') ? data.spectral_flatness.toFixed(3) : 'n/a';
+            const msg = `Sim ${sim} / Thr ${data.threshold} | is_teacher: ${data.is_teacher} | rms ${data.rms?.toFixed ? data.rms.toFixed(3) : 'n/a'} | flat ${flat}${data.noise_like ? ' (noise-like)' : ''}`;
             setStatus(msg);
             // meters
             if (typeof data.similarity === 'number') {
