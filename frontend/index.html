@@ -35,6 +35,12 @@
       <label>Threshold <input id="threshold" type="number" value="0.75" step="0.01" min="0" max="1" style="width:6rem;"/></label>
     </div>
 
+    <h2 style="margin-top:1.5rem;">Listening Mode</h2>
+    <div class="row">
+      <button id="btnStartListening" class="secondary">Start Listening</button>
+      <button id="btnStopListening" class="secondary" disabled>Stop Listening</button>
+    </div>
+
     <div class="status" id="status">Status: Ready</div>
   </div>
   <script>
@@ -43,9 +49,11 @@
     const btnStop = document.getElementById('btnStop');
     const btnSave = document.getElementById('btnSave');
     const btnVerify = document.getElementById('btnVerify');
-    const player = document.getElementById('player');
+  const player = document.getElementById('player');
     const clipInfo = document.getElementById('clipInfo');
     const thresholdInput = document.getElementById('threshold');
+  const btnStartListening = document.getElementById('btnStartListening');
+  const btnStopListening = document.getElementById('btnStopListening');
 
     let lastBlob = null;
 
@@ -137,6 +145,14 @@
       statusEl.textContent = 'Status: ' + msg;
     }
 
+    function speak(text) {
+      try {
+        const u = new SpeechSynthesisUtterance(text);
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(u);
+      } catch (e) {}
+    }
+
     btnRecord.onclick = async () => {
       const rec = await ensureRecorder();
       setStatus('Recording…');
@@ -189,6 +205,42 @@
         setStatus(`Similarity: ${data.similarity.toFixed(3)} | Threshold: ${data.threshold} | is_teacher: ${data.is_teacher}`);
       } catch (e) { setStatus('Verify failed: ' + e.message); }
       finally { btnVerify.disabled = false; }
+    };
+
+    // Listening Mode over WebSocket
+    let ws = null;
+    btnStartListening.onclick = () => {
+      if (ws && ws.readyState === WebSocket.OPEN) return;
+      const thr = thresholdInput.value || '0.75';
+      ws = new WebSocket(`ws://localhost:8000/ws/listen?threshold=${encodeURIComponent(thr)}`);
+      ws.onopen = () => { setStatus('Listening started'); btnStartListening.disabled = true; btnStopListening.disabled = false; };
+      ws.onmessage = (evt) => {
+        try {
+          const data = JSON.parse(evt.data);
+          if (data.type === 'result') {
+            const msg = `Similarity ${data.similarity.toFixed(3)} / Thr ${data.threshold} | is_teacher: ${data.is_teacher}`;
+            setStatus(msg);
+            if (data.noise) {
+              // Alert immediately
+              alert('Noise detected, please maintain silence.');
+              speak('Noise detected, please maintain silence.');
+            }
+          } else if (data.type === 'error') {
+            setStatus('Error: ' + data.message);
+          } else if (data.type === 'info') {
+            setStatus('Info: ' + data.message);
+          }
+        } catch (e) { setStatus('WS parse error'); }
+      };
+      ws.onclose = () => { setStatus('Listening stopped'); btnStartListening.disabled = false; btnStopListening.disabled = true; };
+      ws.onerror = () => { setStatus('WebSocket error'); };
+    };
+
+    btnStopListening.onclick = async () => {
+      try { await fetch('http://localhost:8000/listen/stop', { method: 'POST' }); } catch {}
+      try { if (ws) ws.close(); } catch {}
+      ws = null;
+      setStatus('Listening stopped');
     };
 
     setStatus('Ready');
