@@ -8,6 +8,8 @@ import librosa
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import torch
+from .model import EmbeddingNet, load_model as load_embed_model
 import threading
 import asyncio
 import sounddevice as sd
@@ -16,6 +18,7 @@ from collections import deque
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TEACHER_EMB_PATH = DATA_DIR / "teacher_embedding.npy"
+MODEL_PATH = DATA_DIR / "embedding_net.pt"
 
 app = FastAPI(title="Teacher Voice Monitoring - Enrollment")
 app.add_middleware(
@@ -60,6 +63,19 @@ def extract_features(y: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
     return vec
 
 
+def to_model_embedding(vec: np.ndarray) -> np.ndarray:
+    """If a trained model exists, transform vec->embedding; else return normalized vec."""
+    if MODEL_PATH.exists():
+        in_dim = vec.shape[0]
+        model = load_embed_model(str(MODEL_PATH), in_dim=in_dim, emb_dim=128, map_location='cpu')
+        with torch.no_grad():
+            x = torch.from_numpy(vec[None, :])
+            z = model(x).cpu().numpy()[0]
+        return z.astype(np.float32)
+    else:
+        return l2_normalize(vec)
+
+
 def l2_normalize(x: np.ndarray, eps: float = 1e-9) -> np.ndarray:
     n = np.linalg.norm(x) + eps
     return x / n
@@ -88,9 +104,7 @@ async def enroll(audio: UploadFile = File(...)):
     content = await audio.read()
     y = load_audio_from_bytes(content)
     feats = extract_features(y)
-
-    # Placeholder for Siamese model: for now, store normalized aggregated features
-    emb = l2_normalize(feats)
+    emb = to_model_embedding(feats)
     np.save(TEACHER_EMB_PATH, emb)
     return EnrollResponse(ok=True, embedding_dim=int(emb.shape[0]))
 
@@ -104,7 +118,7 @@ async def verify(audio: UploadFile = File(...), threshold: float = Form(0.75)):
     content = await audio.read()
     y = load_audio_from_bytes(content)
     feats = extract_features(y)
-    emb = l2_normalize(feats)
+    emb = to_model_embedding(feats)
 
     sim = cosine_similarity(teacher_emb, emb)
     return VerifyResponse(ok=True, similarity=sim, threshold=threshold, is_teacher=bool(sim >= threshold))
@@ -113,6 +127,11 @@ async def verify(audio: UploadFile = File(...), threshold: float = Form(0.75)):
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+@app.get("/model/status")
+async def model_status():
+    return {"model_present": MODEL_PATH.exists(), "path": str(MODEL_PATH)}
 
 
 class BroadcastHub:
