@@ -5,19 +5,20 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Teacher Voice Monitoring</title>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 2rem; background:#f7f7fb; }
-    .card { background:#fff; padding:1rem 1.25rem; border-radius:12px; box-shadow:0 4px 16px rgba(0,0,0,0.06); max-width:800px; }
+    body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; margin: 2rem; background:linear-gradient(180deg,#f7f7fb 0,#eef2ff 100%); }
+    .card { background:#fff; padding:1.25rem 1.5rem; border-radius:16px; box-shadow:0 10px 30px rgba(0,0,50,0.08); max-width:980px; margin:auto; }
     h1 { margin-top:0; }
-    button { padding:0.75rem 1rem; border:none; border-radius:10px; background:#2d6cdf; color:#fff; cursor:pointer; }
-    button.secondary { background:#6b7280; }
+    button { padding:0.7rem 1rem; border:none; border-radius:10px; background:linear-gradient(180deg,#3b82f6,#2563eb); color:#fff; cursor:pointer; box-shadow:0 6px 14px rgba(37,99,235,0.25); }
+    button.secondary { background:linear-gradient(180deg,#9ca3af,#6b7280); box-shadow:0 6px 14px rgba(107,114,128,0.25); }
     button:disabled { background:#9ca3af; cursor:not-allowed; }
     .row { display:flex; gap:0.75rem; flex-wrap:wrap; }
-    .status { margin-top:0.75rem; padding:0.75rem; background:#eef2ff; border-radius:8px; color:#1e3a8a; }
+    .status { margin-top:0.75rem; padding:0.75rem; background:#eef2ff; border-radius:10px; color:#1e3a8a; }
   .banner { position:fixed; left:50%; transform:translateX(-50%); bottom:24px; background:#fee2e2; color:#991b1b; padding:0.75rem 1rem; border-radius:10px; box-shadow:0 6px 18px rgba(0,0,0,0.12); display:none; z-index:9999; }
-  .panel { margin-top:1rem; padding:0.75rem; background:#f2f2f7; border-radius:10px; }
+  .panel { margin-top:1rem; padding:0.9rem; background:linear-gradient(180deg,#f8fafc,#f2f2f7); border-radius:12px; border:1px solid #e5e7eb; }
   .panel label { display:inline-flex; align-items:center; gap:0.4rem; margin-right:0.75rem; }
   .bar { width:100%; height:10px; background:#e5e7eb; border-radius:6px; overflow:hidden; }
   .barFill { height:100%; background:#10b981; width:0%; transition: width .2s ease; }
+  input[type="text"], input[type="number"] { padding:0.45rem 0.5rem; border:1px solid #e5e7eb; border-radius:8px; }
   </style>
 </head>
 <body>
@@ -53,7 +54,8 @@
         <label>Smooth Win <input id="setSmooth" type="number" value="4" min="1" step="1" style="width:5rem;"/></label>
         <label>Min Noise Cnt <input id="setMinNoise" type="number" value="3" min="1" step="1" style="width:6rem;"/></label>
         <label>Cooldown(s) <input id="setCooldown" type="number" value="3" min="0" step="0.5" style="width:6rem;"/></label>
-        <label>Min RMS <input id="setMinRms" type="number" value="0.02" min="0" step="0.005" style="width:6rem;"/></label>
+  <label>Min RMS <input id="setMinRms" type="number" value="0.02" min="0" step="0.005" style="width:6rem;"/></label>
+  <label>Speech RMS <input id="setSpeechRms" type="number" value="0.04" min="0" step="0.005" style="width:6rem;"/></label>
         <label>Chunk(s) <input id="setChunkSec" type="number" value="2.0" min="0.5" step="0.5" style="width:6rem;"/></label>
         <label>Interval(ms) <input id="setInterval" type="number" value="500" min="100" step="50" style="width:6rem;"/></label>
         <button id="btnApply" class="secondary">Apply</button>
@@ -76,7 +78,7 @@
     <div class="panel">
       <strong>Rolling Graph</strong>
       <div style="font-size:12px; color:#6b7280; margin: 4px 0;">Similarity over time (last 30s)</div>
-      <canvas id="simCanvas" width="760" height="120" style="background:#fff; border-radius:8px; border:1px solid #e5e7eb; width:100%;"></canvas>
+  <canvas id="simCanvas" width="760" height="140" style="background:#fff; border-radius:12px; border:1px solid #e5e7eb; width:100%;"></canvas>
     </div>
 
     <div class="panel">
@@ -89,6 +91,17 @@
         <button id="btnPollTrain" class="secondary">Poll Status</button>
       </div>
       <div id="trainStatus" class="status" style="margin-top:0.5rem;">Training: idle</div>
+    </div>
+
+    <div class="panel">
+      <strong>Dataset Collector</strong>
+      <div class="row" style="margin-top:0.5rem;">
+        <label>Label <input id="dsLabel" type="text" placeholder="teacher or noise or student" style="width:14rem;"/></label>
+        <button id="btnDsRecord">Record</button>
+        <button id="btnDsStop" class="secondary" disabled>Stop</button>
+        <button id="btnDsUpload" disabled>Upload</button>
+        <div id="dsInfo" style="align-self:center; color:#4b5563;">Idle</div>
+      </div>
     </div>
 
     <div class="status" id="status">Status: Ready</div>
@@ -111,6 +124,7 @@
   const setMinNoise = document.getElementById('setMinNoise');
   const setCooldown = document.getElementById('setCooldown');
   const setMinRms = document.getElementById('setMinRms');
+  const setSpeechRms = document.getElementById('setSpeechRms');
   const setChunkSec = document.getElementById('setChunkSec');
   const setIntervalMs = document.getElementById('setInterval');
   const btnApply = document.getElementById('btnApply');
@@ -126,6 +140,11 @@
   const btnStartTrain = document.getElementById('btnStartTrain');
   const btnPollTrain = document.getElementById('btnPollTrain');
   const trainStatus = document.getElementById('trainStatus');
+  const dsLabel = document.getElementById('dsLabel');
+  const btnDsRecord = document.getElementById('btnDsRecord');
+  const btnDsStop = document.getElementById('btnDsStop');
+  const btnDsUpload = document.getElementById('btnDsUpload');
+  const dsInfo = document.getElementById('dsInfo');
 
     let lastBlob = null;
 
@@ -209,7 +228,8 @@
 
     let recorder = null;
     // Rolling graph state
-    const simHistory = [];
+  const simHistory = [];
+  const avgWindow = 8; // moving average over recent points
     const maxPoints = 60; // with 500ms updates ~30s
     function redrawGraph() {
       const c = simCanvas.getContext('2d');
@@ -218,7 +238,12 @@
       // axes
       c.strokeStyle = '#e5e7eb'; c.lineWidth = 1;
       for (let i=0;i<=4;i++){ const y = i*(h/4); c.beginPath(); c.moveTo(0,y); c.lineTo(w,y); c.stroke(); }
-      // plot
+  // threshold band
+  const thr = parseFloat(setThreshold.value || '0.75');
+  c.fillStyle = 'rgba(244, 63, 94, 0.08)'; // red-500 at top band above thr
+  const thrY = h - Math.max(0, Math.min(1, thr)) * h;
+  c.fillRect(0, 0, w, thrY);
+  // plot
       if (simHistory.length < 2) return;
       c.strokeStyle = '#0ea5e9'; c.lineWidth = 2; c.beginPath();
       const n = simHistory.length;
@@ -229,6 +254,19 @@
         if (i===0) c.moveTo(x,y); else c.lineTo(x,y);
       }
       c.stroke();
+      // moving average
+      if (n >= avgWindow) {
+        c.strokeStyle = '#22c55e'; c.lineWidth = 2; c.beginPath();
+        for (let i=0;i<n;i++){
+          const start = Math.max(0, i-avgWindow+1);
+          const slice = simHistory.slice(start, i+1);
+          const mean = slice.reduce((a,b)=>a+b,0)/slice.length;
+          const x = (i/(n-1))*w;
+          const y = h - Math.max(0, Math.min(1, mean))*h;
+          if (i===0) c.moveTo(x,y); else c.lineTo(x,y);
+        }
+        c.stroke();
+      }
     }
     async function ensureRecorder() {
       if (!recorder) recorder = new WavRecorder();
@@ -316,9 +354,10 @@
         smooth_window: setSmooth.value || '4',
         min_noise_count: setMinNoise.value || '3',
         cooldown: setCooldown.value || '3',
-  min_rms: setMinRms.value || '0.02',
-  chunk_sec: setChunkSec.value || '2.0',
-  interval_ms: setIntervalMs.value || '500',
+        min_rms: setMinRms.value || '0.02',
+        speech_rms: setSpeechRms.value || '0.04',
+        chunk_sec: setChunkSec.value || '2.0',
+        interval_ms: setIntervalMs.value || '500',
       });
       ws = new WebSocket(`ws://localhost:8000/ws/listen?${params.toString()}`);
       ws.onopen = () => { setStatus('Listening started'); btnStartListening.disabled = true; btnStopListening.disabled = false; };
@@ -381,10 +420,39 @@
           min_rms: parseFloat(setMinRms.value),
           chunk_sec: parseFloat(setChunkSec.value),
           interval_ms: parseInt(setIntervalMs.value),
+          speech_rms: parseFloat(setSpeechRms.value),
         };
         await fetch('http://localhost:8000/listen/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         setStatus('Settings applied');
       } catch (e) { setStatus('Apply failed'); }
+    };
+
+    // Dataset collector
+    let dsBlob = null;
+    btnDsRecord.onclick = async () => {
+      const rec = await ensureRecorder();
+      dsInfo.textContent = 'Recording…';
+      btnDsRecord.disabled = true; btnDsStop.disabled = false; btnDsUpload.disabled = true;
+      await rec.start();
+    };
+    btnDsStop.onclick = async () => {
+      if (!recorder) return;
+      dsBlob = await recorder.stop();
+      recorder = null;
+      dsInfo.textContent = `${(dsBlob.size/1024).toFixed(1)} KB ready`;
+      btnDsRecord.disabled = false; btnDsStop.disabled = true; btnDsUpload.disabled = false;
+    };
+    btnDsUpload.onclick = async () => {
+      if (!dsBlob) return; if (!dsLabel.value.trim()) { dsInfo.textContent = 'Enter a label'; return; }
+      try {
+        const fd = new FormData();
+        fd.append('label', dsLabel.value.trim());
+        fd.append('audio', dsBlob, 'clip.wav');
+        const res = await fetch('http://localhost:8000/dataset/upload', { method:'POST', body: fd });
+        const j = await res.json();
+        if (j.ok) { dsInfo.textContent = 'Uploaded: ' + j.path; dsBlob = null; btnDsUpload.disabled = true; }
+        else { dsInfo.textContent = 'Upload failed: ' + (j.error || ''); }
+      } catch (e) { dsInfo.textContent = 'Upload error'; }
     };
 
     // Training controls

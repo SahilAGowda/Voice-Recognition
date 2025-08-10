@@ -23,6 +23,8 @@ DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TEACHER_EMB_PATH = DATA_DIR / "teacher_embedding.npy"
 MODEL_PATH = DATA_DIR / "embedding_net.pt"
+DATASET_ROOT = DATA_DIR / "dataset"
+DATASET_ROOT.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Teacher Voice Monitoring - Enrollment")
 app.add_middleware(
@@ -322,12 +324,15 @@ class AudioListener:
         self.alert_cooldown_sec = 3.0
         self._recent = deque(maxlen=10)
         self._cooldown_until = 0.0
-        self.min_rms = 0.02  # energy gate: below this, treat as non-teacher/noise
-        # latency/stride controls
-        self.chunk_sec = CHUNK_SEC
-        self.chunk_samples = int(SAMPLE_RATE * self.chunk_sec)
-        self.interval_ms = 500  # inference interval
-        self.block_sec = 0.25
+    self.min_rms = 0.02  # energy gate: below this, treat as non-teacher/noise
+    # latency/stride controls
+    self.chunk_sec = CHUNK_SEC
+    self.chunk_samples = int(SAMPLE_RATE * self.chunk_sec)
+    self.interval_ms = 500  # inference interval
+    self.block_sec = 0.25
+    # speech activity threshold (only count noise during active speech)
+    self.speech_rms = 0.04
+    self._recent_decisions = deque(maxlen=10)  # only active speech frames
 
     def _callback(self, indata, frames, time, status):  # sounddevice callback
         if status:
@@ -335,7 +340,7 @@ class AudioListener:
         mono = indata[:, 0].astype(np.float32)
         self.buffer.extend(mono.tolist())
 
-    def start(self, teacher_emb: np.ndarray, threshold: float = 0.75, *, smooth_window: Optional[int] = None, min_noise_count: Optional[int] = None, cooldown_sec: Optional[float] = None, min_rms: Optional[float] = None, chunk_sec: Optional[float] = None, interval_ms: Optional[int] = None):
+    def start(self, teacher_emb: np.ndarray, threshold: float = 0.75, *, smooth_window: Optional[int] = None, min_noise_count: Optional[int] = None, cooldown_sec: Optional[float] = None, min_rms: Optional[float] = None, chunk_sec: Optional[float] = None, interval_ms: Optional[int] = None, speech_rms: Optional[float] = None):
         if self.thread and self.thread.is_alive():
             # already running, update threshold and teacher emb
             self.threshold = threshold
@@ -354,6 +359,8 @@ class AudioListener:
                 self.buffer = deque(maxlen=self.chunk_samples * 2)
             if interval_ms is not None and interval_ms >= 100:
                 self.interval_ms = int(interval_ms)
+            if speech_rms is not None:
+                self.speech_rms = float(max(self.min_rms, speech_rms))
             return
         self.threshold = threshold
         self.teacher_emb = teacher_emb
@@ -371,6 +378,8 @@ class AudioListener:
             self.buffer = deque(maxlen=self.chunk_samples * 2)
         if interval_ms is not None and interval_ms >= 100:
             self.interval_ms = int(interval_ms)
+        if speech_rms is not None:
+            self.speech_rms = float(max(self.min_rms, speech_rms))
         self.running.set()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
@@ -390,7 +399,8 @@ class AudioListener:
 
     def _run_loop(self):
         self.buffer.clear()
-        self._recent = deque(maxlen=max(2, self.smooth_window))
+    self._recent = deque(maxlen=max(2, self.smooth_window))
+    self._recent_decisions = deque(maxlen=max(2, self.smooth_window))
         self._cooldown_until = 0.0
         try:
             self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32', callback=self._callback, blocksize=int(self.block_sec * SAMPLE_RATE))
@@ -404,22 +414,23 @@ class AudioListener:
                     # Energy gate
                     t0 = time.time()
                     rms = float(np.sqrt(np.mean(buf ** 2) + 1e-12))
-                    gated = False
-                    if rms < self.min_rms:
-                        sim = -1.0
-                        is_teacher = False
-                        gated = True
-                    else:
+                    gated = rms < self.min_rms
+                    active = rms >= self.speech_rms
+                    sim = -1.0
+                    is_teacher = False
+                    if not gated and active:
                         # Feature and similarity
                         feats = extract_features(buf)
                         emb = to_model_embedding(feats)
                         sim = cosine_similarity(self.teacher_emb, emb)
                         is_teacher = bool(sim >= self.threshold)
                     proc_ms = int((time.time() - t0) * 1000)
-                    # smoothing queue
-                    self._recent.append(is_teacher)
-                    window = list(self._recent)[-self.smooth_window:]
+                    # smoothing over active speech only
+                    if active and not gated:
+                        self._recent_decisions.append(is_teacher)
+                    window = list(self._recent_decisions)[-self.smooth_window:]
                     noise_count = sum(1 for v in window if not v)
+                    active_count = len(window)
                     event = {
                         "type": "result",
                         "similarity": float(sim),
@@ -431,13 +442,16 @@ class AudioListener:
                         "rms": rms,
                         "min_rms": float(self.min_rms),
                         "gated": gated,
+                        "active": active,
+                        "speech_rms": float(self.speech_rms),
+                        "active_count": int(active_count),
                         "ts": time.time(),
                         "proc_ms": proc_ms,
                     }
                     self.hub.publish(event)
                     # fire alert on smoothed condition with cooldown
                     now = time.time()
-                    if noise_count >= self.min_noise_count and now >= self._cooldown_until:
+                    if active_count > 0 and noise_count >= self.min_noise_count and now >= self._cooldown_until:
                         self._cooldown_until = now + self.alert_cooldown_sec
                         self.hub.publish({
                             "type": "noise_alert",
@@ -448,6 +462,8 @@ class AudioListener:
                             "smooth_window": int(self.smooth_window),
                             "rms": rms,
                             "min_rms": float(self.min_rms),
+                            "active": active,
+                            "speech_rms": float(self.speech_rms),
                             "ts": now,
                         })
         except Exception as e:
@@ -466,7 +482,7 @@ listener = AudioListener(hub)
 
 
 @app.websocket("/ws/listen")
-async def ws_listen(ws: WebSocket, threshold: Optional[float] = None, smooth_window: Optional[int] = None, min_noise_count: Optional[int] = None, cooldown: Optional[float] = None, min_rms: Optional[float] = None, chunk_sec: Optional[float] = None, interval_ms: Optional[int] = None):
+async def ws_listen(ws: WebSocket, threshold: Optional[float] = None, smooth_window: Optional[int] = None, min_noise_count: Optional[int] = None, cooldown: Optional[float] = None, min_rms: Optional[float] = None, chunk_sec: Optional[float] = None, interval_ms: Optional[int] = None, speech_rms: Optional[float] = None):
     await ws.accept()
     if not TEACHER_EMB_PATH.exists():
         await ws.send_json({"type": "error", "message": "Teacher not enrolled yet."})
@@ -475,10 +491,10 @@ async def ws_listen(ws: WebSocket, threshold: Optional[float] = None, smooth_win
     teacher_emb = np.load(TEACHER_EMB_PATH)
     thr = float(threshold) if threshold is not None else 0.75
     # Start the listener
-    listener.start(teacher_emb, thr, smooth_window=smooth_window, min_noise_count=min_noise_count, cooldown_sec=cooldown, min_rms=min_rms, chunk_sec=chunk_sec, interval_ms=interval_ms)
+    listener.start(teacher_emb, thr, smooth_window=smooth_window, min_noise_count=min_noise_count, cooldown_sec=cooldown, min_rms=min_rms, chunk_sec=chunk_sec, interval_ms=interval_ms, speech_rms=speech_rms)
     # Subscribe to events
     q = hub.subscribe(asyncio.get_event_loop())
-    await ws.send_json({"type": "info", "message": "listening_started", "threshold": thr, "smooth_window": listener.smooth_window, "min_noise_count": listener.min_noise_count, "cooldown": listener.alert_cooldown_sec, "min_rms": listener.min_rms, "chunk_sec": listener.chunk_sec, "interval_ms": listener.interval_ms})
+    await ws.send_json({"type": "info", "message": "listening_started", "threshold": thr, "smooth_window": listener.smooth_window, "min_noise_count": listener.min_noise_count, "cooldown": listener.alert_cooldown_sec, "min_rms": listener.min_rms, "speech_rms": listener.speech_rms, "chunk_sec": listener.chunk_sec, "interval_ms": listener.interval_ms})
     try:
         while True:
             event = await q.get()
@@ -507,6 +523,7 @@ class ListenConfig(BaseModel):
     min_rms: Optional[float] = None
     chunk_sec: Optional[float] = None
     interval_ms: Optional[int] = None
+    speech_rms: Optional[float] = None
 
 
 @app.post("/listen/config")
@@ -521,6 +538,8 @@ async def listen_config(cfg: ListenConfig):
         listener.alert_cooldown_sec = float(max(0.0, cfg.cooldown_sec))
     if cfg.min_rms is not None:
         listener.min_rms = float(max(0.0, cfg.min_rms))
+    if cfg.speech_rms is not None:
+        listener.speech_rms = float(max(listener.min_rms, cfg.speech_rms))
     if cfg.chunk_sec is not None and cfg.chunk_sec > 0.25:
         listener.chunk_sec = float(cfg.chunk_sec)
         listener.chunk_samples = int(SAMPLE_RATE * listener.chunk_sec)
@@ -534,9 +553,40 @@ async def listen_config(cfg: ListenConfig):
         "min_noise_count": listener.min_noise_count,
         "cooldown_sec": listener.alert_cooldown_sec,
         "min_rms": listener.min_rms,
+        "speech_rms": listener.speech_rms,
         "chunk_sec": listener.chunk_sec,
         "interval_ms": listener.interval_ms,
     }
+
+
+# --- Dataset upload endpoints ---
+def _sanitize_label(lbl: str) -> str:
+    import re
+    s = re.sub(r"[^a-zA-Z0-9_\-]", "_", lbl.strip())
+    return s or "unknown"
+
+
+@app.post("/dataset/upload")
+async def dataset_upload(label: str = Form(...), audio: UploadFile = File(...)):
+    label = _sanitize_label(label)
+    label_dir = DATASET_ROOT / label
+    label_dir.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time() * 1000)
+    out_path = label_dir / f"{ts}.wav"
+    content = await audio.read()
+    try:
+        # trust client WAV and save raw bytes
+        with open(out_path, "wb") as f:
+            f.write(content)
+        return {"ok": True, "path": str(out_path)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/dataset/labels")
+async def dataset_labels():
+    labels = [p.name for p in DATASET_ROOT.glob('*') if p.is_dir()]
+    return {"labels": labels}
 
 
 # If needed to run directly: `uvicorn backend.server:app --reload --port 8000`

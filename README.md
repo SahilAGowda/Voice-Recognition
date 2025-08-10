@@ -51,6 +51,11 @@ python -m http.server 5500
 3. Open http://127.0.0.1:5500/frontend/index.html
 - Enroll: Record -> Stop -> Save Voice
 - Start Listening: watch similarity, TTS alert on noise
+ - Tune controls:
+   - Threshold, Smooth Win, Min Noise Count, Cooldown(s)
+   - Min RMS (energy gate for silence)
+   - Chunk(s) window and Interval(ms) for latency
+   - Speech RMS: only alert on non-teacher when active speech energy >= speech_rms (prevents silence alerts)
 
 ## Milestone 4: Train Siamese model
 Dataset layout:
@@ -67,6 +72,15 @@ Train:
 python backend\train_siamese.py --data path\to\dataset_root --steps 500 --out backend\data\embedding_net.pt
 ```
 After training, the backend automatically uses `backend/data/embedding_net.pt` to produce embeddings on enroll/verify/listening.
+
+Alternatively, train from the UI:
+- Start training with the panel (dataset path, steps, batch) -> calls POST /model/train
+- Poll progress -> GET /model/train/status
+- Re-enroll the teacher after training to store model-based embedding.
+
+Inline dataset uploads (UI):
+- POST /dataset/upload with label and audio (WAV) will save to `backend/data/dataset/<label>/timestamp.wav`
+- GET /dataset/labels lists current labels.
 
 Quick data collection (optional):
 ```
