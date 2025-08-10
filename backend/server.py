@@ -9,6 +9,9 @@ from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 from .model import EmbeddingNet, load_model as load_embed_model
 import threading
 import asyncio
@@ -133,6 +136,152 @@ async def health():
 @app.get("/model/status")
 async def model_status():
     return {"model_present": MODEL_PATH.exists(), "path": str(MODEL_PATH)}
+
+
+# --- Background training support (Triplet loss) ---
+class TrainConfig(BaseModel):
+    data: str = str(Path("backend/data/dataset").as_posix())
+    out: str = str(MODEL_PATH)
+    emb: int = 128
+    bs: int = 32
+    lr: float = 1e-3
+    margin: float = 0.5
+    steps: int = 500
+
+
+class TrainStatus(BaseModel):
+    running: bool
+    step: int = 0
+    steps: int = 0
+    loss: float | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    error: str | None = None
+    out_path: str | None = None
+
+
+_train_lock = threading.Lock()
+_train_thread: Optional[threading.Thread] = None
+_train_status = TrainStatus(running=False, step=0, steps=0)
+
+
+class TripletAudioDatasetInline(Dataset):
+    def __init__(self, root: Path, sr: int = SAMPLE_RATE):
+        self.root = Path(root)
+        self.sr = sr
+        self.by_label: dict[str, list[Path]] = {}
+        for p in sorted(self.root.glob('*')):
+            if p.is_dir():
+                wavs = list(p.glob('*.wav'))
+                if len(wavs) >= 2:
+                    self.by_label[p.name] = wavs
+        self.labels = list(self.by_label.keys())
+        if len(self.labels) < 2:
+            raise RuntimeError("Dataset must contain at least 2 labels with >=2 wavs each")
+
+    def __len__(self):
+        return 10000
+
+    def _load_wav(self, path: Path):
+        y, _ = librosa.load(path, sr=self.sr, mono=True)
+        if len(y) == 0:
+            y = np.zeros(self.sr, dtype=np.float32)
+        y = y / (np.max(np.abs(y)) + 1e-9)
+        return y.astype(np.float32)
+
+    def __getitem__(self, idx):
+        import random
+        a_lbl = random.choice(self.labels)
+        pos_files = self.by_label[a_lbl]
+        if len(pos_files) < 2:
+            return self.__getitem__(idx + 1)
+        a_path, p_path = random.sample(pos_files, 2)
+        n_lbl = random.choice([l for l in self.labels if l != a_lbl])
+        n_path = random.choice(self.by_label[n_lbl])
+
+        def to_feat(path: Path):
+            y = self._load_wav(path)
+            return extract_features(y)
+
+        a = to_feat(a_path)
+        p = to_feat(p_path)
+        n = to_feat(n_path)
+        return (
+            torch.tensor(a, dtype=torch.float32),
+            torch.tensor(p, dtype=torch.float32),
+            torch.tensor(n, dtype=torch.float32),
+        )
+
+
+def _run_training(cfg: TrainConfig):
+    global _train_status
+    _train_status = TrainStatus(running=True, step=0, steps=cfg.steps, started_at=time.time())
+    try:
+        root = Path(cfg.data)
+        ds = TripletAudioDatasetInline(root)
+        # infer input dim
+        a, p, n = ds[0]
+        in_dim = a.numel()
+        model = EmbeddingNet(in_dim=in_dim, emb_dim=cfg.emb)
+        model.train()
+
+        def collate(batch):
+            a = torch.stack([b[0] for b in batch])
+            p = torch.stack([b[1] for b in batch])
+            n = torch.stack([b[2] for b in batch])
+            return a, p, n
+
+        dl = DataLoader(ds, batch_size=cfg.bs, shuffle=True, num_workers=0, collate_fn=collate)
+        opt = optim.Adam(model.parameters(), lr=cfg.lr)
+        triplet = nn.TripletMarginLoss(margin=cfg.margin, p=2.0)
+
+        step = 0
+        for (a, p, n) in dl:
+            # z-score normalize per batch
+            def norm(x):
+                m = x.mean(dim=0, keepdim=True)
+                s = x.std(dim=0, keepdim=True) + 1e-6
+                return (x - m) / s
+            a = norm(a); p = norm(p); n = norm(n)
+            za = model(a); zp = model(p); zn = model(n)
+            loss = triplet(za, zp, zn)
+            opt.zero_grad(); loss.backward(); opt.step()
+            step += 1
+            _train_status.step = step
+            _train_status.loss = float(loss.item())
+            if step >= cfg.steps:
+                break
+
+        # save
+        out_path = Path(cfg.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), out_path)
+        _train_status.out_path = str(out_path)
+        _train_status.running = False
+        _train_status.finished_at = time.time()
+    except Exception as e:
+        _train_status.error = str(e)
+        _train_status.running = False
+        _train_status.finished_at = time.time()
+
+
+@app.post("/model/train")
+async def model_train(cfg: TrainConfig):
+    global _train_thread
+    with _train_lock:
+        if _train_thread and _train_thread.is_alive():
+            return {"ok": False, "message": "Training already in progress"}
+        # reset status and start thread
+        def runner():
+            _run_training(cfg)
+        _train_thread = threading.Thread(target=runner, daemon=True)
+        _train_thread.start()
+    return {"ok": True, "message": "Training started", "config": cfg.dict()}
+
+
+@app.get("/model/train/status")
+async def model_train_status():
+    return _train_status.dict()
 
 
 class BroadcastHub:

@@ -73,6 +73,24 @@
       <div id="procInfo" style="margin-top:0.5rem; font-size:12px; color:#6b7280;"></div>
     </div>
 
+    <div class="panel">
+      <strong>Rolling Graph</strong>
+      <div style="font-size:12px; color:#6b7280; margin: 4px 0;">Similarity over time (last 30s)</div>
+      <canvas id="simCanvas" width="760" height="120" style="background:#fff; border-radius:8px; border:1px solid #e5e7eb; width:100%;"></canvas>
+    </div>
+
+    <div class="panel">
+      <strong>Model Training</strong>
+      <div class="row" style="margin-top:0.5rem;">
+        <label>Dataset Path <input id="trainData" type="text" style="width:16rem;" value="backend/data/dataset"/></label>
+        <label>Steps <input id="trainSteps" type="number" min="100" step="100" value="500" style="width:6rem;"/></label>
+        <label>Batch <input id="trainBS" type="number" min="8" step="1" value="32" style="width:5rem;"/></label>
+        <button id="btnStartTrain">Start Training</button>
+        <button id="btnPollTrain" class="secondary">Poll Status</button>
+      </div>
+      <div id="trainStatus" class="status" style="margin-top:0.5rem;">Training: idle</div>
+    </div>
+
     <div class="status" id="status">Status: Ready</div>
   </div>
   <div class="banner" id="banner">Noise detected, please maintain silence.</div>
@@ -101,6 +119,13 @@
   const simVal = document.getElementById('simVal');
   const rmsVal = document.getElementById('rmsVal');
   const procInfo = document.getElementById('procInfo');
+  const simCanvas = document.getElementById('simCanvas');
+  const trainData = document.getElementById('trainData');
+  const trainSteps = document.getElementById('trainSteps');
+  const trainBS = document.getElementById('trainBS');
+  const btnStartTrain = document.getElementById('btnStartTrain');
+  const btnPollTrain = document.getElementById('btnPollTrain');
+  const trainStatus = document.getElementById('trainStatus');
 
     let lastBlob = null;
 
@@ -183,6 +208,28 @@
     }
 
     let recorder = null;
+    // Rolling graph state
+    const simHistory = [];
+    const maxPoints = 60; // with 500ms updates ~30s
+    function redrawGraph() {
+      const c = simCanvas.getContext('2d');
+      const w = simCanvas.width, h = simCanvas.height;
+      c.clearRect(0,0,w,h);
+      // axes
+      c.strokeStyle = '#e5e7eb'; c.lineWidth = 1;
+      for (let i=0;i<=4;i++){ const y = i*(h/4); c.beginPath(); c.moveTo(0,y); c.lineTo(w,y); c.stroke(); }
+      // plot
+      if (simHistory.length < 2) return;
+      c.strokeStyle = '#0ea5e9'; c.lineWidth = 2; c.beginPath();
+      const n = simHistory.length;
+      for (let i=0;i<n;i++){
+        const x = (i/(n-1))*w;
+        const v = Math.max(0, Math.min(1, simHistory[i]));
+        const y = h - v*h;
+        if (i===0) c.moveTo(x,y); else c.lineTo(x,y);
+      }
+      c.stroke();
+    }
     async function ensureRecorder() {
       if (!recorder) recorder = new WavRecorder();
       return recorder;
@@ -279,6 +326,11 @@
         try {
           const data = JSON.parse(evt.data);
           if (data.type === 'result') {
+            if (typeof data.similarity === 'number') {
+              simHistory.push(Math.max(0, Math.min(1, data.similarity)));
+              while (simHistory.length > maxPoints) simHistory.shift();
+              redrawGraph();
+            }
             const sim = (typeof data.similarity === 'number') ? data.similarity.toFixed(3) : 'n/a';
             const msg = `Sim ${sim} / Thr ${data.threshold} | is_teacher: ${data.is_teacher} | rms ${data.rms?.toFixed ? data.rms.toFixed(3) : 'n/a'}`;
             setStatus(msg);
@@ -333,6 +385,38 @@
         await fetch('http://localhost:8000/listen/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         setStatus('Settings applied');
       } catch (e) { setStatus('Apply failed'); }
+    };
+
+    // Training controls
+    btnStartTrain.onclick = async () => {
+      try {
+        const body = {
+          data: trainData.value,
+          steps: parseInt(trainSteps.value, 10),
+          bs: parseInt(trainBS.value, 10)
+        };
+        const res = await fetch('http://localhost:8000/model/train', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await res.json();
+        trainStatus.textContent = 'Training: ' + (j.ok ? 'started' : ('not started: ' + (j.message || '')));
+      } catch (e) {
+        trainStatus.textContent = 'Training start failed';
+      }
+    };
+
+    btnPollTrain.onclick = async () => {
+      try {
+        const res = await fetch('http://localhost:8000/model/train/status');
+        const j = await res.json();
+        trainStatus.textContent = `Training: ${j.running ? 'running' : 'idle'} | step ${j.step}/${j.steps} | loss ${j.loss ?? '-'}${j.error ? ' | error: '+j.error : ''}`;
+        if (!j.running && j.out_path) {
+          const st = await (await fetch('http://localhost:8000/model/status')).json();
+          if (st.model_present) {
+            trainStatus.textContent += ' | model ready, re-enroll recommended';
+          }
+        }
+      } catch (e) {
+        trainStatus.textContent = 'Training status failed';
+      }
     };
 
     setStatus('Ready');
