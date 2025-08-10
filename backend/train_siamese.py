@@ -7,8 +7,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import librosa
-from model import EmbeddingNet, save_model
-from server import SAMPLE_RATE, N_MFCC, extract_features
+from backend.model import EmbeddingNet, save_model
+from backend.server import SAMPLE_RATE, N_MFCC, extract_features
 
 
 class TripletAudioDataset(Dataset):
