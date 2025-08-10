@@ -16,6 +16,8 @@
   .banner { position:fixed; left:50%; transform:translateX(-50%); bottom:24px; background:#fee2e2; color:#991b1b; padding:0.75rem 1rem; border-radius:10px; box-shadow:0 6px 18px rgba(0,0,0,0.12); display:none; z-index:9999; }
   .panel { margin-top:1rem; padding:0.75rem; background:#f2f2f7; border-radius:10px; }
   .panel label { display:inline-flex; align-items:center; gap:0.4rem; margin-right:0.75rem; }
+  .bar { width:100%; height:10px; background:#e5e7eb; border-radius:6px; overflow:hidden; }
+  .barFill { height:100%; background:#10b981; width:0%; transition: width .2s ease; }
   </style>
 </head>
 <body>
@@ -52,8 +54,23 @@
         <label>Min Noise Cnt <input id="setMinNoise" type="number" value="3" min="1" step="1" style="width:6rem;"/></label>
         <label>Cooldown(s) <input id="setCooldown" type="number" value="3" min="0" step="0.5" style="width:6rem;"/></label>
         <label>Min RMS <input id="setMinRms" type="number" value="0.02" min="0" step="0.005" style="width:6rem;"/></label>
+        <label>Chunk(s) <input id="setChunkSec" type="number" value="2.0" min="0.5" step="0.5" style="width:6rem;"/></label>
+        <label>Interval(ms) <input id="setInterval" type="number" value="500" min="100" step="50" style="width:6rem;"/></label>
         <button id="btnApply" class="secondary">Apply</button>
       </div>
+    </div>
+
+    <div class="panel">
+      <strong>Live Meters</strong>
+      <div style="margin-top:0.5rem;">
+        <div>Similarity: <span id="simVal">-</span></div>
+        <div class="bar"><div id="simBar" class="barFill"></div></div>
+      </div>
+      <div style="margin-top:0.5rem;">
+        <div>RMS: <span id="rmsVal">-</span></div>
+        <div class="bar"><div id="rmsBar" class="barFill" style="background:#6366f1;"></div></div>
+      </div>
+      <div id="procInfo" style="margin-top:0.5rem; font-size:12px; color:#6b7280;"></div>
     </div>
 
     <div class="status" id="status">Status: Ready</div>
@@ -76,7 +93,14 @@
   const setMinNoise = document.getElementById('setMinNoise');
   const setCooldown = document.getElementById('setCooldown');
   const setMinRms = document.getElementById('setMinRms');
+  const setChunkSec = document.getElementById('setChunkSec');
+  const setIntervalMs = document.getElementById('setInterval');
   const btnApply = document.getElementById('btnApply');
+  const simBar = document.getElementById('simBar');
+  const rmsBar = document.getElementById('rmsBar');
+  const simVal = document.getElementById('simVal');
+  const rmsVal = document.getElementById('rmsVal');
+  const procInfo = document.getElementById('procInfo');
 
     let lastBlob = null;
 
@@ -245,7 +269,9 @@
         smooth_window: setSmooth.value || '4',
         min_noise_count: setMinNoise.value || '3',
         cooldown: setCooldown.value || '3',
-        min_rms: setMinRms.value || '0.02',
+  min_rms: setMinRms.value || '0.02',
+  chunk_sec: setChunkSec.value || '2.0',
+  interval_ms: setIntervalMs.value || '500',
       });
       ws = new WebSocket(`ws://localhost:8000/ws/listen?${params.toString()}`);
       ws.onopen = () => { setStatus('Listening started'); btnStartListening.disabled = true; btnStopListening.disabled = false; };
@@ -256,6 +282,22 @@
             const sim = (typeof data.similarity === 'number') ? data.similarity.toFixed(3) : 'n/a';
             const msg = `Sim ${sim} / Thr ${data.threshold} | is_teacher: ${data.is_teacher} | rms ${data.rms?.toFixed ? data.rms.toFixed(3) : 'n/a'}`;
             setStatus(msg);
+            // meters
+            if (typeof data.similarity === 'number') {
+              const s = Math.max(0, Math.min(1, data.similarity));
+              simBar.style.width = (s * 100).toFixed(0) + '%';
+              simVal.textContent = s.toFixed(3);
+            }
+            if (typeof data.rms === 'number') {
+              const denom = Math.max(0.001, (data.min_rms || 0.02) * 2);
+              const r = Math.max(0, Math.min(1, data.rms / denom));
+              rmsBar.style.width = (r * 100).toFixed(0) + '%';
+              rmsVal.textContent = data.rms.toFixed(3);
+            }
+            if (typeof data.proc_ms === 'number' && typeof data.ts === 'number') {
+              const t = new Date(data.ts * 1000).toLocaleTimeString();
+              procInfo.textContent = `${t} • proc ${data.proc_ms} ms`;
+            }
           } else if (data.type === 'noise_alert') {
             showBanner('Noise detected, please maintain silence.');
             speak('Noise detected, please maintain silence.');
@@ -285,6 +327,8 @@
           min_noise_count: parseInt(setMinNoise.value),
           cooldown_sec: parseFloat(setCooldown.value),
           min_rms: parseFloat(setMinRms.value),
+          chunk_sec: parseFloat(setChunkSec.value),
+          interval_ms: parseInt(setIntervalMs.value),
         };
         await fetch('http://localhost:8000/listen/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         setStatus('Settings applied');
