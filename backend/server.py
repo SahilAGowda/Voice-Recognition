@@ -14,6 +14,7 @@ import threading
 import asyncio
 import sounddevice as sd
 from collections import deque
+import time
 
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -166,6 +167,13 @@ class AudioListener:
         self.teacher_emb: Optional[np.ndarray] = None
         self.buffer = deque(maxlen=CHUNK_SAMPLES * 2)  # keep some extra
         self.stream: Optional[sd.InputStream] = None
+        # smoothing & alert params
+        self.smooth_window = 4
+        self.min_noise_count = 3
+        self.alert_cooldown_sec = 3.0
+        self._recent = deque(maxlen=10)
+        self._cooldown_until = 0.0
+        self.min_rms = 0.02  # energy gate: below this, treat as non-teacher/noise
 
     def _callback(self, indata, frames, time, status):  # sounddevice callback
         if status:
@@ -173,14 +181,30 @@ class AudioListener:
         mono = indata[:, 0].astype(np.float32)
         self.buffer.extend(mono.tolist())
 
-    def start(self, teacher_emb: np.ndarray, threshold: float = 0.75):
+    def start(self, teacher_emb: np.ndarray, threshold: float = 0.75, *, smooth_window: Optional[int] = None, min_noise_count: Optional[int] = None, cooldown_sec: Optional[float] = None, min_rms: Optional[float] = None):
         if self.thread and self.thread.is_alive():
             # already running, update threshold and teacher emb
             self.threshold = threshold
             self.teacher_emb = teacher_emb
+            if smooth_window is not None:
+                self.smooth_window = int(max(1, smooth_window))
+            if min_noise_count is not None:
+                self.min_noise_count = int(max(1, min_noise_count))
+            if cooldown_sec is not None:
+                self.alert_cooldown_sec = float(max(0.0, cooldown_sec))
+            if min_rms is not None:
+                self.min_rms = float(max(0.0, min_rms))
             return
         self.threshold = threshold
         self.teacher_emb = teacher_emb
+        if smooth_window is not None:
+            self.smooth_window = int(max(1, smooth_window))
+        if min_noise_count is not None:
+            self.min_noise_count = int(max(1, min_noise_count))
+        if cooldown_sec is not None:
+            self.alert_cooldown_sec = float(max(0.0, cooldown_sec))
+        if min_rms is not None:
+            self.min_rms = float(max(0.0, min_rms))
         self.running.set()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
@@ -200,6 +224,8 @@ class AudioListener:
 
     def _run_loop(self):
         self.buffer.clear()
+        self._recent = deque(maxlen=max(2, self.smooth_window))
+        self._cooldown_until = 0.0
         try:
             self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32', callback=self._callback, blocksize=int(0.5 * SAMPLE_RATE))
             self.stream.start()
@@ -209,19 +235,50 @@ class AudioListener:
                 if len(self.buffer) >= CHUNK_SAMPLES:
                     # Take the newest 2s
                     buf = np.array(list(self.buffer)[-CHUNK_SAMPLES:], dtype=np.float32)
-                    # Feature and similarity
-                    feats = extract_features(buf)
-                    emb = l2_normalize(feats)
-                    sim = cosine_similarity(self.teacher_emb, emb)
-                    is_teacher = bool(sim >= self.threshold)
+                    # Energy gate
+                    rms = float(np.sqrt(np.mean(buf ** 2) + 1e-12))
+                    gated = False
+                    if rms < self.min_rms:
+                        sim = -1.0
+                        is_teacher = False
+                        gated = True
+                    else:
+                        # Feature and similarity
+                        feats = extract_features(buf)
+                        emb = to_model_embedding(feats)
+                        sim = cosine_similarity(self.teacher_emb, emb)
+                        is_teacher = bool(sim >= self.threshold)
+                    # smoothing queue
+                    self._recent.append(is_teacher)
+                    window = list(self._recent)[-self.smooth_window:]
+                    noise_count = sum(1 for v in window if not v)
                     event = {
                         "type": "result",
                         "similarity": float(sim),
                         "threshold": float(self.threshold),
                         "is_teacher": is_teacher,
                         "noise": (not is_teacher),
+                        "noise_count": int(noise_count),
+                        "smooth_window": int(self.smooth_window),
+                        "rms": rms,
+                        "min_rms": float(self.min_rms),
+                        "gated": gated,
                     }
                     self.hub.publish(event)
+                    # fire alert on smoothed condition with cooldown
+                    now = time.time()
+                    if noise_count >= self.min_noise_count and now >= self._cooldown_until:
+                        self._cooldown_until = now + self.alert_cooldown_sec
+                        self.hub.publish({
+                            "type": "noise_alert",
+                            "message": "Noise detected, please maintain silence.",
+                            "similarity": float(sim),
+                            "threshold": float(self.threshold),
+                            "noise_count": int(noise_count),
+                            "smooth_window": int(self.smooth_window),
+                            "rms": rms,
+                            "min_rms": float(self.min_rms),
+                        })
         except Exception as e:
             self.hub.publish({"type": "error", "message": str(e)})
         finally:
@@ -238,7 +295,7 @@ listener = AudioListener(hub)
 
 
 @app.websocket("/ws/listen")
-async def ws_listen(ws: WebSocket, threshold: Optional[float] = None):
+async def ws_listen(ws: WebSocket, threshold: Optional[float] = None, smooth_window: Optional[int] = None, min_noise_count: Optional[int] = None, cooldown: Optional[float] = None, min_rms: Optional[float] = None):
     await ws.accept()
     if not TEACHER_EMB_PATH.exists():
         await ws.send_json({"type": "error", "message": "Teacher not enrolled yet."})
@@ -247,10 +304,10 @@ async def ws_listen(ws: WebSocket, threshold: Optional[float] = None):
     teacher_emb = np.load(TEACHER_EMB_PATH)
     thr = float(threshold) if threshold is not None else 0.75
     # Start the listener
-    listener.start(teacher_emb, thr)
+    listener.start(teacher_emb, thr, smooth_window=smooth_window, min_noise_count=min_noise_count, cooldown_sec=cooldown, min_rms=min_rms)
     # Subscribe to events
     q = hub.subscribe(asyncio.get_event_loop())
-    await ws.send_json({"type": "info", "message": "listening_started", "threshold": thr})
+    await ws.send_json({"type": "info", "message": "listening_started", "threshold": thr, "smooth_window": listener.smooth_window, "min_noise_count": listener.min_noise_count, "cooldown": listener.alert_cooldown_sec, "min_rms": listener.min_rms})
     try:
         while True:
             event = await q.get()
@@ -269,6 +326,36 @@ async def ws_listen(ws: WebSocket, threshold: Optional[float] = None):
 async def listen_stop():
     listener.stop()
     return {"ok": True, "message": "stopped"}
+
+
+class ListenConfig(BaseModel):
+    threshold: Optional[float] = None
+    smooth_window: Optional[int] = None
+    min_noise_count: Optional[int] = None
+    cooldown_sec: Optional[float] = None
+    min_rms: Optional[float] = None
+
+
+@app.post("/listen/config")
+async def listen_config(cfg: ListenConfig):
+    if cfg.threshold is not None:
+        listener.threshold = float(cfg.threshold)
+    if cfg.smooth_window is not None:
+        listener.smooth_window = int(max(1, cfg.smooth_window))
+    if cfg.min_noise_count is not None:
+        listener.min_noise_count = int(max(1, cfg.min_noise_count))
+    if cfg.cooldown_sec is not None:
+        listener.alert_cooldown_sec = float(max(0.0, cfg.cooldown_sec))
+    if cfg.min_rms is not None:
+        listener.min_rms = float(max(0.0, cfg.min_rms))
+    return {
+        "ok": True,
+        "threshold": listener.threshold,
+        "smooth_window": listener.smooth_window,
+        "min_noise_count": listener.min_noise_count,
+        "cooldown_sec": listener.alert_cooldown_sec,
+        "min_rms": listener.min_rms,
+    }
 
 
 # If needed to run directly: `uvicorn backend.server:app --reload --port 8000`

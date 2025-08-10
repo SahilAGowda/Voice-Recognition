@@ -13,6 +13,9 @@
     button:disabled { background:#9ca3af; cursor:not-allowed; }
     .row { display:flex; gap:0.75rem; flex-wrap:wrap; }
     .status { margin-top:0.75rem; padding:0.75rem; background:#eef2ff; border-radius:8px; color:#1e3a8a; }
+  .banner { position:fixed; left:50%; transform:translateX(-50%); bottom:24px; background:#fee2e2; color:#991b1b; padding:0.75rem 1rem; border-radius:10px; box-shadow:0 6px 18px rgba(0,0,0,0.12); display:none; z-index:9999; }
+  .panel { margin-top:1rem; padding:0.75rem; background:#f2f2f7; border-radius:10px; }
+  .panel label { display:inline-flex; align-items:center; gap:0.4rem; margin-right:0.75rem; }
   </style>
 </head>
 <body>
@@ -41,8 +44,21 @@
       <button id="btnStopListening" class="secondary" disabled>Stop Listening</button>
     </div>
 
+    <div class="panel">
+      <strong>Settings</strong>
+      <div class="row" style="margin-top:0.5rem;">
+        <label>Threshold <input id="setThreshold" type="number" value="0.75" step="0.01" min="0" max="1" style="width:6rem;"/></label>
+        <label>Smooth Win <input id="setSmooth" type="number" value="4" min="1" step="1" style="width:5rem;"/></label>
+        <label>Min Noise Cnt <input id="setMinNoise" type="number" value="3" min="1" step="1" style="width:6rem;"/></label>
+        <label>Cooldown(s) <input id="setCooldown" type="number" value="3" min="0" step="0.5" style="width:6rem;"/></label>
+        <label>Min RMS <input id="setMinRms" type="number" value="0.02" min="0" step="0.005" style="width:6rem;"/></label>
+        <button id="btnApply" class="secondary">Apply</button>
+      </div>
+    </div>
+
     <div class="status" id="status">Status: Ready</div>
   </div>
+  <div class="banner" id="banner">Noise detected, please maintain silence.</div>
   <script>
     const statusEl = document.getElementById('status');
     const btnRecord = document.getElementById('btnRecord');
@@ -54,6 +70,13 @@
     const thresholdInput = document.getElementById('threshold');
   const btnStartListening = document.getElementById('btnStartListening');
   const btnStopListening = document.getElementById('btnStopListening');
+  const banner = document.getElementById('banner');
+  const setThreshold = document.getElementById('setThreshold');
+  const setSmooth = document.getElementById('setSmooth');
+  const setMinNoise = document.getElementById('setMinNoise');
+  const setCooldown = document.getElementById('setCooldown');
+  const setMinRms = document.getElementById('setMinRms');
+  const btnApply = document.getElementById('btnApply');
 
     let lastBlob = null;
 
@@ -153,6 +176,12 @@
       } catch (e) {}
     }
 
+    function showBanner(text) {
+      banner.textContent = text;
+      banner.style.display = 'block';
+      setTimeout(() => { banner.style.display = 'none'; }, 1500);
+    }
+
     btnRecord.onclick = async () => {
       const rec = await ensureRecorder();
       setStatus('Recording…');
@@ -211,20 +240,25 @@
     let ws = null;
     btnStartListening.onclick = () => {
       if (ws && ws.readyState === WebSocket.OPEN) return;
-      const thr = thresholdInput.value || '0.75';
-      ws = new WebSocket(`ws://localhost:8000/ws/listen?threshold=${encodeURIComponent(thr)}`);
+      const params = new URLSearchParams({
+        threshold: setThreshold.value || '0.75',
+        smooth_window: setSmooth.value || '4',
+        min_noise_count: setMinNoise.value || '3',
+        cooldown: setCooldown.value || '3',
+        min_rms: setMinRms.value || '0.02',
+      });
+      ws = new WebSocket(`ws://localhost:8000/ws/listen?${params.toString()}`);
       ws.onopen = () => { setStatus('Listening started'); btnStartListening.disabled = true; btnStopListening.disabled = false; };
       ws.onmessage = (evt) => {
         try {
           const data = JSON.parse(evt.data);
           if (data.type === 'result') {
-            const msg = `Similarity ${data.similarity.toFixed(3)} / Thr ${data.threshold} | is_teacher: ${data.is_teacher}`;
+            const sim = (typeof data.similarity === 'number') ? data.similarity.toFixed(3) : 'n/a';
+            const msg = `Sim ${sim} / Thr ${data.threshold} | is_teacher: ${data.is_teacher} | rms ${data.rms?.toFixed ? data.rms.toFixed(3) : 'n/a'}`;
             setStatus(msg);
-            if (data.noise) {
-              // Alert immediately
-              alert('Noise detected, please maintain silence.');
-              speak('Noise detected, please maintain silence.');
-            }
+          } else if (data.type === 'noise_alert') {
+            showBanner('Noise detected, please maintain silence.');
+            speak('Noise detected, please maintain silence.');
           } else if (data.type === 'error') {
             setStatus('Error: ' + data.message);
           } else if (data.type === 'info') {
@@ -241,6 +275,20 @@
       try { if (ws) ws.close(); } catch {}
       ws = null;
       setStatus('Listening stopped');
+    };
+
+    btnApply.onclick = async () => {
+      try {
+        const body = {
+          threshold: parseFloat(setThreshold.value),
+          smooth_window: parseInt(setSmooth.value),
+          min_noise_count: parseInt(setMinNoise.value),
+          cooldown_sec: parseFloat(setCooldown.value),
+          min_rms: parseFloat(setMinRms.value),
+        };
+        await fetch('http://localhost:8000/listen/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        setStatus('Settings applied');
+      } catch (e) { setStatus('Apply failed'); }
     };
 
     setStatus('Ready');
