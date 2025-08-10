@@ -19,10 +19,179 @@
   <div class="card">
     <h1>Teacher Voice Monitoring</h1>
 
-    <h2>Milestone 1: Setup</h2>
-    <p>We'll wire these buttons in later milestones. For now, use the backend mic test script.</p>
+    <h2>Milestone 2: Teacher Enrollment</h2>
+    <p>Record the teacher's voice and save the embedding.</p>
+    <div class="row" style="margin-bottom:0.5rem;">
+      <button id="btnRecord">Record Teacher Voice</button>
+      <button id="btnStop" class="secondary" disabled>Stop</button>
+      <button id="btnSave" disabled>Save Voice</button>
+    </div>
+    <div>Last clip: <span id="clipInfo">none</span></div>
+    <audio id="player" controls style="margin-top:0.5rem; width:100%;"></audio>
+
+    <h3 style="margin-top:1.25rem;">Quick Verify</h3>
+    <div class="row">
+      <button id="btnVerify" disabled>Record & Verify</button>
+      <label>Threshold <input id="threshold" type="number" value="0.75" step="0.01" min="0" max="1" style="width:6rem;"/></label>
+    </div>
 
     <div class="status" id="status">Status: Ready</div>
   </div>
+  <script>
+    const statusEl = document.getElementById('status');
+    const btnRecord = document.getElementById('btnRecord');
+    const btnStop = document.getElementById('btnStop');
+    const btnSave = document.getElementById('btnSave');
+    const btnVerify = document.getElementById('btnVerify');
+    const player = document.getElementById('player');
+    const clipInfo = document.getElementById('clipInfo');
+    const thresholdInput = document.getElementById('threshold');
+
+    let lastBlob = null;
+
+    // Simple in-browser WAV recorder using ScriptProcessorNode
+    class WavRecorder {
+      constructor() {
+        this.audioCtx = null;
+        this.source = null;
+        this.processor = null;
+        this.stream = null;
+        this.buffers = [];
+        this.sampleRate = 44100;
+        this.resolveStop = null;
+      }
+      async init() {
+        this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        this.sampleRate = this.audioCtx.sampleRate;
+        this.source = this.audioCtx.createMediaStreamSource(this.stream);
+        this.processor = this.audioCtx.createScriptProcessor(4096, 1, 1);
+        this.source.connect(this.processor);
+        this.processor.connect(this.audioCtx.destination);
+        this.processor.onaudioprocess = (e) => {
+          const input = e.inputBuffer.getChannelData(0);
+          // Copy the data to avoid using the same underlying buffer
+          this.buffers.push(new Float32Array(input));
+        };
+      }
+      async start() {
+        if (!this.audioCtx) await this.init();
+        this.buffers = [];
+      }
+      async stop() {
+        // Disconnect processor to stop collecting
+        try { this.processor.disconnect(); } catch {}
+        try { this.source.disconnect(); } catch {}
+        try { this.stream.getTracks().forEach(t => t.stop()); } catch {}
+        // Flatten buffers
+        const length = this.buffers.reduce((a, b) => a + b.length, 0);
+        const pcm = new Float32Array(length);
+        let offset = 0;
+        for (const buf of this.buffers) { pcm.set(buf, offset); offset += buf.length; }
+        // Encode WAV as 16-bit PCM
+        const wavBlob = this.encodeWAV(pcm, this.sampleRate);
+        // Clean up audio context
+        try { await this.audioCtx.close(); } catch {}
+        this.audioCtx = null;
+        return wavBlob;
+      }
+      encodeWAV(samples, sampleRate) {
+        // Convert Float32 [-1,1] to 16-bit PCM
+        const buffer = new ArrayBuffer(44 + samples.length * 2);
+        const view = new DataView(buffer);
+        const writeString = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
+        const floatTo16 = (out, offset, input) => {
+          for (let i = 0; i < input.length; i++, offset += 2) {
+            let s = Math.max(-1, Math.min(1, input[i]));
+            view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+          }
+        };
+        // RIFF header
+        writeString(0, 'RIFF');
+        view.setUint32(4, 36 + samples.length * 2, true);
+        writeString(8, 'WAVE');
+        // fmt chunk
+        writeString(12, 'fmt ');
+        view.setUint32(16, 16, true); // PCM
+        view.setUint16(20, 1, true); // format = 1 (PCM)
+        view.setUint16(22, 1, true); // channels = 1
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, sampleRate * 2, true); // byte rate (sampleRate * blockAlign)
+        view.setUint16(32, 2, true); // block align (channels * bytesPerSample)
+        view.setUint16(34, 16, true); // bits per sample
+        // data chunk
+        writeString(36, 'data');
+        view.setUint32(40, samples.length * 2, true);
+        floatTo16(view, 44, samples);
+        return new Blob([view], { type: 'audio/wav' });
+      }
+    }
+
+    let recorder = null;
+    async function ensureRecorder() {
+      if (!recorder) recorder = new WavRecorder();
+      return recorder;
+    }
+
+    function setStatus(msg) {
+      statusEl.textContent = 'Status: ' + msg;
+    }
+
+    btnRecord.onclick = async () => {
+      const rec = await ensureRecorder();
+      setStatus('Recording…');
+      btnRecord.disabled = true; btnStop.disabled = false; btnSave.disabled = true; btnVerify.disabled = true;
+      await rec.start();
+    };
+    btnStop.onclick = () => {
+      (async () => {
+        if (!recorder) return;
+        lastBlob = await recorder.stop();
+        player.src = URL.createObjectURL(lastBlob);
+        clipInfo.textContent = `${(lastBlob.size/1024).toFixed(1)} KB`;
+        setStatus('Recorded clip ready');
+        btnRecord.disabled = false; btnStop.disabled = true; btnSave.disabled = false; btnVerify.disabled = false;
+        recorder = null;
+      })();
+    };
+
+    async function postBlob(url, blob, extraFormData = {}) {
+      const fd = new FormData();
+  fd.append('audio', blob, 'clip.wav');
+      Object.entries(extraFormData).forEach(([k,v]) => fd.append(k, v));
+      const res = await fetch(url, { method: 'POST', body: fd });
+      if (!res.ok) throw new Error('Request failed');
+      return res.json();
+    }
+
+    btnSave.onclick = async () => {
+      if (!lastBlob) return setStatus('No clip to save');
+      try {
+        setStatus('Uploading for enrollment…');
+        const data = await postBlob('http://localhost:8000/enroll', lastBlob);
+        setStatus(`Enrolled. Embedding dim ${data.embedding_dim}`);
+      } catch (e) { setStatus('Enroll failed: ' + e.message); }
+    };
+
+    btnVerify.onclick = async () => {
+  const rec = await ensureRecorder();
+  setStatus('Recording 2s for verification…');
+  btnVerify.disabled = true;
+  await rec.start();
+  await new Promise(r => setTimeout(r, 2000));
+  lastBlob = await rec.stop();
+  player.src = URL.createObjectURL(lastBlob);
+  clipInfo.textContent = `${(lastBlob.size/1024).toFixed(1)} KB`;
+  recorder = null;
+      try {
+        setStatus('Uploading for verification…');
+        const data = await postBlob('http://localhost:8000/verify', lastBlob, { threshold: thresholdInput.value });
+        setStatus(`Similarity: ${data.similarity.toFixed(3)} | Threshold: ${data.threshold} | is_teacher: ${data.is_teacher}`);
+      } catch (e) { setStatus('Verify failed: ' + e.message); }
+      finally { btnVerify.disabled = false; }
+    };
+
+    setStatus('Ready');
+  </script>
 </body>
 </html>
